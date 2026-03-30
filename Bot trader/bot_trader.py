@@ -1,6 +1,6 @@
 """
-Bot Telegram MT5 — Version corrigée complète
-Tous les bugs critiques corrigés + EA MQ5 intégré
+Bot Telegram MT5 — Version Railway (HTTP Bridge)
+Communication MT5 via webhook HTTP au lieu de fichiers locaux.
 """
 
 import os
@@ -9,9 +9,11 @@ import time
 import asyncio
 import logging
 import functools
+import secrets
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -22,52 +24,22 @@ from telegram.ext import (
 # ============================================================
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "METS_TON_TOKEN_ICI")
-ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0"))
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+ADMIN_CHAT_ID   = int(os.getenv("ADMIN_CHAT_ID", "0"))
+BRIDGE_SECRET   = os.getenv("BRIDGE_SECRET", "change_me_please")  # clé partagée avec l'EA
+PORT            = int(os.getenv("PORT", "8080"))                   # Railway injecte PORT
 
-SYMBOLS        = [
-    # ── Forex majeurs (les plus tradés au monde) ──
-    "EURUSD",   # Euro / Dollar
-    "GBPUSD",   # Livre / Dollar
-    "USDJPY",   # Dollar / Yen
-    "USDCHF",   # Dollar / Franc suisse
-    "AUDUSD",   # Australien / Dollar
-    "USDCAD",   # Dollar / Canadien
-    "NZDUSD",   # Néo-zélandais / Dollar
-    # ── Forex croisées populaires ──
-    "EURGBP",   # Euro / Livre
-    "EURJPY",   # Euro / Yen
-    "GBPJPY",   # Livre / Yen
-    # ── Or & Matières premières ──
-    "XAUUSD",   # Or (le plus tradé)
-    "XAGUSD",   # Argent
-    "USOIL",    # Pétrole WTI
-    "UKOIL",    # Pétrole Brent
-    # ── Crypto (top par volume) ──
-    "BTCUSD",   # Bitcoin
-    "ETHUSD",   # Ethereum
-    "XRPUSD",   # Ripple
-    "LTCUSD",   # Litecoin
-    "BNBUSD",   # BNB
-    "SOLUSD",   # Solana
-    # ── Indices boursiers ──
-    "US500",    # S&P 500
-    "US100",    # Nasdaq
-    "GER40",    # DAX Allemagne
-    "UK100",    # FTSE 100
+SYMBOLS = [
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
+    "EURGBP", "EURJPY", "GBPJPY",
+    "XAUUSD", "XAGUSD", "USOIL", "UKOIL",
+    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "BNBUSD", "SOLUSD",
+    "US500", "US100", "GER40", "UK100",
 ]
 DEFAULT_LOT    = 0.01
-SCAN_INTERVAL  = 300       # secondes entre chaque scan auto
-SIGNAL_TTL     = 600       # secondes avant expiration d'un signal (10 min)
-CMD_TIMEOUT    = 8.0       # timeout EA en secondes
-
-# Dossier partagé MT5 — configurable via .env
-MT5_COMMON = os.getenv(
-    "MT5_COMMON_PATH",
-    os.path.expandvars(r"%APPDATA%\MetaQuotes\Terminal\Common\Files")
-)
-ORDER_FILE  = os.path.join(MT5_COMMON, "telegram_order.txt")
-RESULT_FILE = os.path.join(MT5_COMMON, "telegram_result.txt")
+SCAN_INTERVAL  = 300
+SIGNAL_TTL     = 600
+CMD_TIMEOUT    = 15.0   # plus long car réseau
 
 # Fichiers de persistance
 USERS_FILE = "authorized_users.json"
@@ -89,7 +61,9 @@ authorized_users: set[int] = {ADMIN_CHAT_ID}
 pending_signals: dict[str, dict] = {}
 session_stats = {"trades": 0, "wins": 0, "losses": 0, "profit": 0.0}
 
-# Lock pour éviter la race condition sur les fichiers MT5
+# ── Bridge HTTP ──
+# L'EA envoie son résultat ici, le bot l'attend via asyncio.Event
+_pending_result: dict = {"event": None, "data": None}
 _mt5_lock = asyncio.Lock()
 
 # ============================================================
@@ -133,49 +107,97 @@ def save_stats():
         logger.error(f"Erreur sauvegarde stats: {e}")
 
 # ============================================================
-#  BRIDGE MT5 — VERSION ASYNC CORRIGÉE
+#  SERVEUR HTTP — reçoit les réponses de l'EA MT5
 # ============================================================
-def _write_command(cmd: str):
-    """Écrit la commande dans le fichier ORDER (synchrone, exécuté en executor)."""
-    if os.path.exists(RESULT_FILE):
-        os.remove(RESULT_FILE)
-    # Écriture en UTF-8 sans BOM pour compatibilité MQ5
-    with open(ORDER_FILE, "w", encoding="utf-8", newline="\n") as f:
-        f.write(cmd.strip())
+# Routes exposées :
+#   POST /mt5/result  ← l'EA envoie son résultat ici
+#   GET  /health      ← Railway health check
 
-def _read_result() -> str | None:
-    """Attend et lit le fichier RESULT (synchrone, exécuté en executor)."""
-    deadline = time.time() + CMD_TIMEOUT
-    while time.time() < deadline:
-        if os.path.exists(RESULT_FILE):
-            with open(RESULT_FILE, "r", encoding="latin-1") as f:
-                result = f.read().strip()
-            try:
-                os.remove(RESULT_FILE)
-            except Exception:
-                pass
-            return result
-        time.sleep(0.2)
-    return None
+async def handle_mt5_result(request: web.Request) -> web.Response:
+    """L'EA appelle cette URL après avoir exécuté une commande."""
+    # Vérification de la clé secrète
+    auth = request.headers.get("X-Bridge-Secret", "")
+    if auth != BRIDGE_SECRET:
+        logger.warning("⚠️ Tentative non autorisée sur /mt5/result")
+        return web.Response(status=403, text="Forbidden")
 
+    try:
+        body = await request.json()
+        result_text = body.get("result", "")
+    except Exception:
+        return web.Response(status=400, text="Bad JSON")
+
+    logger.info(f"📥 Résultat MT5 reçu: {result_text[:80]}")
+
+    # Réveille le waiter s'il y en a un
+    if _pending_result["event"] is not None:
+        _pending_result["data"] = result_text
+        _pending_result["event"].set()
+
+    return web.Response(text="OK")
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def handle_mt5_command(request: web.Request) -> web.Response:
+    """
+    L'EA poll cette URL pour recevoir des commandes.
+    L'EA appelle GET /mt5/command toutes les secondes.
+    Si une commande est en attente, on la renvoie, sinon "NONE".
+    """
+    auth = request.headers.get("X-Bridge-Secret", "")
+    if auth != BRIDGE_SECRET:
+        return web.Response(status=403, text="Forbidden")
+
+    cmd = _pending_result.get("cmd")
+    if cmd:
+        _pending_result["cmd"] = None  # consommé
+        logger.info(f"📤 Commande envoyée à l'EA: {cmd}")
+        return web.Response(text=cmd)
+    return web.Response(text="NONE")
+
+
+def create_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/mt5/command", handle_mt5_command)
+    app.router.add_post("/mt5/result", handle_mt5_result)
+    return app
+
+# ============================================================
+#  BRIDGE MT5 — ENVOI/ATTENTE VIA HTTP
+# ============================================================
 async def send_command(cmd: str) -> str | None:
     """
-    Envoie une commande à l'EA et attend le résultat.
-    - Async : ne bloque pas l'event loop
-    - Protégé par un Lock : pas de race condition
+    Dépose une commande et attend la réponse de l'EA via HTTP.
+    Protégé par un Lock pour éviter les requêtes simultanées.
     """
     async with _mt5_lock:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _write_command, cmd)
-        result = await loop.run_in_executor(None, _read_result)
-        return result
+        event = asyncio.Event()
+        _pending_result["event"] = event
+        _pending_result["data"]  = None
+        _pending_result["cmd"]   = cmd
+
+        logger.info(f"📤 Commande en attente: {cmd}")
+
+        try:
+            # Attend que l'EA envoie son résultat
+            await asyncio.wait_for(event.wait(), timeout=CMD_TIMEOUT)
+            return _pending_result["data"]
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Timeout commande: {cmd}")
+            return None
+        finally:
+            _pending_result["event"] = None
+            _pending_result["cmd"]   = None
 
 def parse_result(result: str | None) -> tuple[bool, str]:
-    """Transforme la réponse brute de l'EA en (succès, message lisible)."""
     if result is None:
         return False, (
             "⏱️ *Timeout* — L'EA n'a pas répondu.\n"
-            "_Vérifie que TelegramBridge tourne sur un graphique dans MT5._"
+            "_Vérifie que TelegramBridge HTTP tourne dans MT5._"
         )
     parts = result.split("|")
     if not parts:
@@ -187,14 +209,12 @@ def parse_result(result: str | None) -> tuple[bool, str]:
 
 async def place_order(symbol: str, direction: str, lot: float,
                       sl: float, tp: float) -> tuple[bool, str]:
-    # Format strict : DIRECTION|SYMBOL|LOT|SL|TP (sans espaces)
     cmd = f"{direction}|{symbol}|{lot:.2f}|{sl:.5f}|{tp:.5f}"
     result = await send_command(cmd)
     ok, msg = parse_result(result)
     if ok:
         parts = [p for p in msg.split("\n") if p.strip()]
         info = "\n".join(f"▸ {p}" for p in parts) if parts else msg
-        # Mise à jour stats
         session_stats["trades"] += 1
         save_stats()
         return True, f"✅ *Ordre exécuté !*\n{info}"
@@ -230,7 +250,6 @@ async def get_positions_text() -> str:
         if part.startswith("POS:"):
             fields = part.split(":")[1:]
             if len(fields) < 9:
-                logger.warning(f"Position mal formée: {part}")
                 continue
             try:
                 ticket, sym, direction, vol, popen, pcur, psl, ptp, profit = fields[:9]
@@ -243,54 +262,30 @@ async def get_positions_text() -> str:
                 )
             except (ValueError, IndexError) as e:
                 logger.warning(f"Erreur parsing position: {e}")
-                continue
     return "\n".join(lines)
 
 # ============================================================
-#  ANALYSE TECHNIQUE
+#  ANALYSE TECHNIQUE (inchangée)
 # ============================================================
-_signal_cache: dict[str, dict] = {}  # {symbol: {"ts": float, "data": df}}
+_signal_cache: dict[str, dict] = {}
 
 def get_signal(symbol: str) -> dict | None:
     try:
         import yfinance as yf
         yf_map = {
-            # Forex majeurs
-            "EURUSD": "EURUSD=X",
-            "GBPUSD": "GBPUSD=X",
-            "USDJPY": "USDJPY=X",
-            "USDCHF": "USDCHF=X",
-            "AUDUSD": "AUDUSD=X",
-            "USDCAD": "USDCAD=X",
-            "NZDUSD": "NZDUSD=X",
-            # Forex croisées
-            "EURGBP": "EURGBP=X",
-            "EURJPY": "EURJPY=X",
-            "GBPJPY": "GBPJPY=X",
-            # Or & Matières premières
-            "XAUUSD": "GC=F",
-            "XAGUSD": "SI=F",
-            "USOIL":  "CL=F",
-            "UKOIL":  "BZ=F",
-            # Crypto
-            "BTCUSD": "BTC-USD",
-            "ETHUSD": "ETH-USD",
-            "XRPUSD": "XRP-USD",
-            "LTCUSD": "LTC-USD",
-            "BNBUSD": "BNB-USD",
-            "SOLUSD": "SOL-USD",
-            # Indices
-            "US500":  "^GSPC",
-            "US100":  "^NDX",
-            "GER40":  "^GDAXI",
-            "UK100":  "^FTSE",
+            "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
+            "USDCHF": "USDCHF=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
+            "NZDUSD": "NZDUSD=X", "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X",
+            "GBPJPY": "GBPJPY=X", "XAUUSD": "GC=F",    "XAGUSD": "SI=F",
+            "USOIL":  "CL=F",     "UKOIL":  "BZ=F",     "BTCUSD": "BTC-USD",
+            "ETHUSD": "ETH-USD",  "XRPUSD": "XRP-USD",  "LTCUSD": "LTC-USD",
+            "BNBUSD": "BNB-USD",  "SOLUSD": "SOL-USD",  "US500":  "^GSPC",
+            "US100":  "^NDX",     "GER40":  "^GDAXI",   "UK100":  "^FTSE",
         }
         ticker = yf_map.get(symbol)
         if not ticker:
-            logger.warning(f"Symbole non mappé: {symbol}")
             return None
 
-        # Cache 5 minutes
         cache = _signal_cache.get(symbol)
         if cache and (time.time() - cache["ts"]) < 300:
             df = cache["df"]
@@ -302,25 +297,18 @@ def get_signal(symbol: str) -> dict | None:
             df.columns = ["close", "high", "low"]
             _signal_cache[symbol] = {"ts": time.time(), "df": df}
 
-        # EMA
         df["ema50"]  = df["close"].ewm(span=50).mean()
         df["ema200"] = df["close"].ewm(span=200).mean()
-
-        # RSI — protégé contre division par zéro
         delta = df["close"].diff()
         gain  = delta.where(delta > 0, 0).rolling(14).mean()
         loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        loss  = loss.replace(0, 1e-10)  # évite ZeroDivisionError
+        loss  = loss.replace(0, 1e-10)
         df["rsi"] = 100 - (100 / (1 + gain / loss))
-
-        # MACD
         ema12 = df["close"].ewm(span=12).mean()
         ema26 = df["close"].ewm(span=26).mean()
         df["macd"]      = ema12 - ema26
         df["macd_sig"]  = df["macd"].ewm(span=9).mean()
         df["macd_hist"] = df["macd"] - df["macd_sig"]
-
-        # ATR
         df["tr"] = pd.concat([
             df["high"] - df["low"],
             (df["high"] - df["close"].shift()).abs(),
@@ -360,7 +348,7 @@ def get_signal(symbol: str) -> dict | None:
             "tp":        tp,
             "lot":       DEFAULT_LOT,
             "rsi":       round(float(last["rsi"]), 1),
-            "ts":        time.time(),  # timestamp pour TTL
+            "ts":        time.time(),
         }
     except Exception as e:
         logger.error(f"Erreur analyse {symbol}: {e}")
@@ -389,7 +377,7 @@ def format_signal_message(sig: dict, signal_id: str) -> tuple[str, InlineKeyboar
     return text, keyboard
 
 # ============================================================
-#  SÉCURITÉ — DÉCORATEURS CORRIGÉS (functools.wraps)
+#  SÉCURITÉ
 # ============================================================
 def is_authorized(uid: int) -> bool:
     return uid in authorized_users
@@ -398,7 +386,7 @@ def is_admin(uid: int) -> bool:
     return uid == ADMIN_CHAT_ID
 
 def auth_check(func):
-    @functools.wraps(func)  # ← CORRIGÉ : évite le conflit de noms dans PTB
+    @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_authorized(update.effective_user.id):
             await update.message.reply_text("⛔ Accès refusé.")
@@ -407,7 +395,7 @@ def auth_check(func):
     return wrapper
 
 def admin_check(func):
-    @functools.wraps(func)  # ← CORRIGÉ
+    @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update.effective_user.id):
             await update.message.reply_text("⛔ Commande réservée à l'admin.")
@@ -416,7 +404,7 @@ def admin_check(func):
     return wrapper
 
 # ============================================================
-#  COMMANDES
+#  COMMANDES TELEGRAM
 # ============================================================
 @auth_check
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,7 +426,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▸ /closeall — Ferme tout\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔔 *SIGNAUX*\n"
-        "▸ /signal — Analyse et propose un trade\n""▸ /conseil SYMBOL — Conseils LOT/SL/TP sur un actif\n\n"
+        "▸ /signal — Analyse et propose un trade\n"
+        "▸ /conseil SYMBOL — Conseils LOT/SL/TP\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📈 *STATS*\n"
         "▸ /stats — Statistiques de session\n\n"
@@ -475,7 +464,7 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sl     = float(args[2])
         tp     = float(args[3])
     except ValueError:
-        await update.message.reply_text("❌ Paramètres invalides. LOT, SL et TP doivent être des nombres.")
+        await update.message.reply_text("❌ Paramètres invalides.")
         return
     await update.message.reply_text(f"⏳ Envoi ordre BUY {symbol}...")
     ok, msg = await place_order(symbol, "BUY", lot, sl, tp)
@@ -496,7 +485,7 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sl     = float(args[2])
         tp     = float(args[3])
     except ValueError:
-        await update.message.reply_text("❌ Paramètres invalides. LOT, SL et TP doivent être des nombres.")
+        await update.message.reply_text("❌ Paramètres invalides.")
         return
     await update.message.reply_text(f"⏳ Envoi ordre SELL {symbol}...")
     ok, msg = await place_order(symbol, "SELL", lot, sl, tp)
@@ -511,9 +500,6 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ Fermeture ticket {ticket}...")
     result = await send_command(f"CLOSE|{ticket}")
     ok, msg = parse_result(result)
-    if ok:
-        session_stats["trades"] = max(0, session_stats["trades"])
-        save_stats()
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 @auth_check
@@ -541,14 +527,11 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-
 @auth_check
 async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "❌ Usage : `/conseil SYMBOL`\n"
-            "_Ex: /conseil EURUSD_\n"
-            "_Ex: /conseil BTCUSD_",
+            "❌ Usage : `/conseil SYMBOL`\n_Ex: /conseil EURUSD_",
             parse_mode="Markdown"
         )
         return
@@ -558,8 +541,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         import yfinance as yf
-        import numpy as np
-
         yf_map = {
             "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
             "USDCHF": "USDCHF=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
@@ -570,17 +551,11 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "BNBUSD": "BNB-USD",  "SOLUSD": "SOL-USD",  "US500":  "^GSPC",
             "US100":  "^NDX",     "GER40":  "^GDAXI",   "UK100":  "^FTSE",
         }
-
         ticker = yf_map.get(symbol)
         if not ticker:
-            await update.message.reply_text(
-                f"❌ Symbole *{symbol}* non reconnu.\n"
-                f"_Symboles disponibles : {', '.join(yf_map.keys())}_",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"❌ Symbole *{symbol}* non reconnu.", parse_mode="Markdown")
             return
 
-        # Téléchargement données
         df = yf.download(ticker, period="10d", interval="15m", progress=False)
         if df is None or len(df) < 50:
             await update.message.reply_text(f"❌ Pas assez de données pour *{symbol}*.", parse_mode="Markdown")
@@ -589,34 +564,24 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = df[["Close", "High", "Low", "Volume"]].copy()
         df.columns = ["close", "high", "low", "volume"]
 
-        # ── Indicateurs ──
-        # EMA
         df["ema20"]  = df["close"].ewm(span=20).mean()
         df["ema50"]  = df["close"].ewm(span=50).mean()
         df["ema200"] = df["close"].ewm(span=200).mean()
-
-        # RSI
         delta = df["close"].diff()
         gain  = delta.where(delta > 0, 0).rolling(14).mean()
         loss  = (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, 1e-10)
         df["rsi"] = 100 - (100 / (1 + gain / loss))
-
-        # MACD
         ema12 = df["close"].ewm(span=12).mean()
         ema26 = df["close"].ewm(span=26).mean()
         df["macd"]      = ema12 - ema26
         df["macd_sig"]  = df["macd"].ewm(span=9).mean()
         df["macd_hist"] = df["macd"] - df["macd_sig"]
-
-        # ATR (volatilité)
         df["tr"] = pd.concat([
             df["high"] - df["low"],
             (df["high"] - df["close"].shift()).abs(),
             (df["low"]  - df["close"].shift()).abs(),
         ], axis=1).max(axis=1)
         df["atr"] = df["tr"].rolling(14).mean()
-
-        # Bollinger Bands
         df["bb_mid"]   = df["close"].rolling(20).mean()
         df["bb_std"]   = df["close"].rolling(20).std()
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
@@ -628,12 +593,10 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         atr   = float(last["atr"])
         rsi   = float(last["rsi"])
 
-        # ── Détermination direction ──
         score_buy  = 0
         score_sell = 0
         signals_detail = []
 
-        # EMA trend
         if last["ema20"] > last["ema50"] > last["ema200"]:
             score_buy += 2
             signals_detail.append("📈 Tendance haussière (EMA 20>50>200)")
@@ -647,7 +610,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             score_sell += 1
             signals_detail.append("📉 Tendance moyen terme baissière")
 
-        # RSI
         if rsi < 35:
             score_buy += 2
             signals_detail.append(f"🟢 RSI survendu ({rsi:.1f})")
@@ -663,7 +625,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             score_sell += 1
             signals_detail.append(f"🟡 RSI légèrement suracheté ({rsi:.1f})")
 
-        # MACD
         if last["macd_hist"] > 0 and prev["macd_hist"] < last["macd_hist"]:
             score_buy += 2
             signals_detail.append("📈 MACD momentum haussier")
@@ -677,7 +638,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             score_sell += 1
             signals_detail.append("📉 MACD en-dessous du signal")
 
-        # Bollinger Bands
         if price <= float(last["bb_lower"]) * 1.001:
             score_buy += 1
             signals_detail.append("🟢 Prix proche bande basse Bollinger")
@@ -685,11 +645,7 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             score_sell += 1
             signals_detail.append("🔴 Prix proche bande haute Bollinger")
 
-        # ── Score total et direction ──
         total_score = score_buy + score_sell
-        confidence  = 0
-        direction   = None
-
         if score_buy > score_sell:
             direction  = "BUY"
             confidence = round((score_buy / max(total_score, 1)) * 100)
@@ -700,12 +656,9 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction  = "NEUTRE"
             confidence = 50
 
-        # ── Calcul SL / TP basé sur ATR ──
-        # SL = 1.5× ATR, TP = 3× ATR (RR 1:2)
         sl_dist = atr * 1.5
         tp_dist = atr * 3.0
 
-        # Décimales selon le type d'actif
         if symbol in ["USDJPY", "EURJPY", "GBPJPY"]:
             decimals = 3
         elif symbol in ["BTCUSD", "US500", "US100", "GER40", "UK100"]:
@@ -728,29 +681,18 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tp = round(price + tp_dist, decimals)
 
         rr = round(tp_dist / max(sl_dist, 1e-10), 1)
-
-        # ── Conseil LOT selon volatilité ──
-        # Volatilité = ATR en % du prix
         volatility_pct = (atr / price) * 100
-
         if volatility_pct < 0.3:
-            lot_conseil = 0.10
-            vol_label   = "faible"
+            lot_conseil, vol_label = 0.10, "faible"
         elif volatility_pct < 0.8:
-            lot_conseil = 0.05
-            vol_label   = "modérée"
+            lot_conseil, vol_label = 0.05, "modérée"
         elif volatility_pct < 1.5:
-            lot_conseil = 0.02
-            vol_label   = "élevée"
+            lot_conseil, vol_label = 0.02, "élevée"
         else:
-            lot_conseil = 0.01
-            vol_label   = "très élevée"
+            lot_conseil, vol_label = 0.01, "très élevée"
 
-        # ── Construction du message ──
         dir_emoji = "📈" if direction == "BUY" else ("📉" if direction == "SELL" else "➡️")
         conf_bar  = "🟩" * (confidence // 20) + "⬜" * (5 - confidence // 20)
-
-        # Niveau de confiance
         if confidence >= 75:
             conf_label = "Forte"
         elif confidence >= 60:
@@ -761,7 +703,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conf_label = "Faible"
 
         signals_txt = "\n".join(f"  {s}" for s in signals_detail)
-
         msg = (
             f"🎯 *CONSEIL DE TRADING — {symbol}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -777,7 +718,6 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{signals_txt}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
-
         if direction != "NEUTRE" and confidence >= 60:
             cmd_example = f"/{'buy' if direction == 'BUY' else 'sell'} {symbol} {lot_conseil} {sl} {tp}"
             msg += f"✅ *Commande prête à copier :*\n`{cmd_example}`"
@@ -785,13 +725,9 @@ async def cmd_conseil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "⚠️ _Signal trop faible — attends une meilleure opportunité._"
 
         await update.message.reply_text(msg, parse_mode="Markdown")
-
     except Exception as e:
         logger.error(f"Erreur conseil {symbol}: {e}")
-        await update.message.reply_text(
-            f"❌ Erreur lors de l'analyse de *{symbol}* : `{e}`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"❌ Erreur : `{e}`", parse_mode="Markdown")
 
 @auth_check
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -815,7 +751,7 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ ID invalide. Doit être un nombre entier.")
+        await update.message.reply_text("❌ ID invalide.")
         return
     authorized_users.add(uid)
     save_users()
@@ -829,7 +765,7 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ ID invalide. Doit être un nombre entier.")
+        await update.message.reply_text("❌ ID invalide.")
         return
     if uid == ADMIN_CHAT_ID:
         await update.message.reply_text("⛔ Tu ne peux pas te retirer toi-même.")
@@ -850,7 +786,7 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================================
-#  CALLBACK BOUTONS — CORRIGÉ (TTL + try/except)
+#  CALLBACK BOUTONS
 # ============================================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -860,7 +796,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔ Accès refusé.")
         return
 
-    # Parsing sécurisé du callback_data
     try:
         action, signal_id = query.data.split("_", 1)
     except ValueError:
@@ -872,12 +807,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Signal expiré ou déjà traité.")
         return
 
-    # Vérification TTL (10 minutes)
     if time.time() - sig.get("ts", 0) > SIGNAL_TTL:
         del pending_signals[signal_id]
         await query.edit_message_text(
-            f"⏱️ *Signal {sig['symbol']} expiré* (>{SIGNAL_TTL//60} min).\n"
-            "_Lance /signal pour un nouveau signal._",
+            f"⏱️ *Signal {sig['symbol']} expiré.*\n_Lance /signal pour un nouveau signal._",
             parse_mode="Markdown"
         )
         return
@@ -889,21 +822,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok, msg = await place_order(sig["symbol"], sig["direction"], sig["lot"], sig["sl"], sig["tp"])
         await query.edit_message_text(msg, parse_mode="Markdown")
     else:
-        await query.edit_message_text(
-            f"❌ *Signal {sig['symbol']} refusé.*",
-            parse_mode="Markdown"
-        )
-
+        await query.edit_message_text(f"❌ *Signal {sig['symbol']} refusé.*", parse_mode="Markdown")
 
 # ============================================================
-#  MONITORING DES TRADES — NOTIF BILAN À LA FERMETURE
+#  MONITORING DES TRADES
 # ============================================================
-
-# Stocke les positions ouvertes connues : {ticket: {symbol, direction, lot, open_price, sl, tp, open_time}}
 _open_positions: dict[int, dict] = {}
 
 async def _fetch_open_positions() -> dict[int, dict]:
-    """Récupère les positions ouvertes actuelles via l'EA."""
     result = await send_command("POSITIONS")
     ok, msg = parse_result(result)
     positions = {}
@@ -931,97 +857,58 @@ async def _fetch_open_positions() -> dict[int, dict]:
     return positions
 
 async def monitor_trades(app):
-    """
-    Vérifie toutes les 10s si une position s'est fermée.
-    Quand une position disparaît → envoie un bilan Telegram.
-    """
     global _open_positions, session_stats
-
-    # Attente initiale pour laisser le bot démarrer
     await asyncio.sleep(15)
-
-    # Initialisation : snapshot des positions actuelles
     _open_positions = await _fetch_open_positions()
     logger.info(f"📊 Monitor trades démarré — {len(_open_positions)} position(s) en cours")
 
     while True:
-        await asyncio.sleep(10)  # Vérifie toutes les 10 secondes
+        await asyncio.sleep(10)
         try:
             current = await _fetch_open_positions()
-
-            # Détection des positions fermées (étaient dans _open_positions, plus dans current)
             closed_tickets = set(_open_positions.keys()) - set(current.keys())
 
             for ticket in closed_tickets:
                 pos = _open_positions[ticket]
                 profit = pos["profit"]
-                symbol = pos["symbol"]
-                direction = pos["direction"]
-                lot = pos["lot"]
-                open_price = pos["open_price"]
-
-                # Mise à jour des stats
                 session_stats["trades"] += 1
                 session_stats["profit"] = round(session_stats["profit"] + profit, 2)
                 if profit >= 0:
                     session_stats["wins"] += 1
-                    result_emoji = "✅"
-                    result_label = "GAGNANT"
+                    result_emoji, result_label = "✅", "GAGNANT"
                 else:
                     session_stats["losses"] += 1
-                    result_emoji = "❌"
-                    result_label = "PERDANT"
+                    result_emoji, result_label = "❌", "PERDANT"
                 save_stats()
 
-                # Winrate global
                 total = session_stats["trades"]
                 winrate = round((session_stats["wins"] / total) * 100, 1) if total > 0 else 0
+                dir_emoji = "📈" if pos["direction"] == "BUY" else "📉"
 
-                # Direction emoji
-                dir_emoji = "📈" if direction == "BUY" else "📉"
-
-                # Bilan message
                 bilan = (
                     f"{result_emoji} *TRADE FERMÉ — {result_label}*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"{dir_emoji} *{direction} {symbol}*\n\n"
+                    f"{dir_emoji} *{pos['direction']} {pos['symbol']}*\n\n"
                     f"▸ Ticket      : `#{ticket}`\n"
-                    f"▸ Lot         : `{lot}`\n"
-                    f"▸ Prix ouvert : `{open_price}`\n"
+                    f"▸ Lot         : `{pos['lot']}`\n"
+                    f"▸ Prix ouvert : `{pos['open_price']}`\n"
                     f"▸ Prix fermé  : `{pos['cur_price']}`\n"
                     f"▸ P&L         : `{'+ ' if profit >= 0 else ''}{round(profit, 2)}$`\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 *Statistiques de session*\n"
-                    f"▸ Trades  : `{session_stats['trades']}`\n"
-                    f"▸ Gagnés  : `{session_stats['wins']}` | Perdus : `{session_stats['losses']}`\n"
-                    f"▸ Winrate : `{winrate}%`\n"
-                    f"▸ P&L total : `{'+ ' if session_stats['profit'] >= 0 else ''}{session_stats['profit']}$`"
+                    f"📊 *Stats de session*\n"
+                    f"▸ Trades : `{session_stats['trades']}` | Winrate : `{winrate}%`\n"
+                    f"▸ P&L total : `{session_stats['profit']}$`"
                 )
+                await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=bilan, parse_mode="Markdown")
 
-                await app.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=bilan,
-                    parse_mode="Markdown"
-                )
-                logger.info(f"📬 Bilan envoyé — ticket #{ticket} | P&L: {profit}$")
-
-            # Détection des nouvelles positions ouvertes
-            new_tickets = set(current.keys()) - set(_open_positions.keys())
-            for ticket in new_tickets:
-                pos = current[ticket]
-                logger.info(f"📌 Nouvelle position détectée — #{ticket} {pos['direction']} {pos['symbol']}")
-
-            # Mise à jour du snapshot
             _open_positions = current
-
         except Exception as e:
             logger.error(f"Erreur monitor trades: {e}")
 
 # ============================================================
-#  NETTOYAGE DES SIGNAUX EXPIRÉS
+#  TÂCHES DE FOND
 # ============================================================
 async def cleanup_signals():
-    """Supprime les signaux expirés toutes les 5 minutes."""
     while True:
         await asyncio.sleep(300)
         now = time.time()
@@ -1032,17 +919,12 @@ async def cleanup_signals():
         if expired:
             logger.info(f"🧹 {len(expired)} signal(s) expiré(s) supprimé(s)")
 
-# ============================================================
-#  SCAN AUTO AVEC BACK-OFF
-# ============================================================
 async def auto_signal_scan(app):
     consecutive_errors = 0
     while True:
-        # Back-off exponentiel en cas d'erreurs réseau
         interval = min(SCAN_INTERVAL * (2 ** consecutive_errors), 1800)
         await asyncio.sleep(interval)
         errors_this_round = 0
-
         for symbol in SYMBOLS:
             try:
                 sig = get_signal(symbol)
@@ -1059,15 +941,10 @@ async def auto_signal_scan(app):
             except Exception as e:
                 logger.error(f"Erreur scan auto {symbol}: {e}")
                 errors_this_round += 1
-
-        if errors_this_round >= len(SYMBOLS):
-            consecutive_errors += 1
-            logger.warning(f"Back-off activé : prochain scan dans {min(SCAN_INTERVAL * (2 ** consecutive_errors), 1800)}s")
-        else:
-            consecutive_errors = 0
+        consecutive_errors = consecutive_errors + 1 if errors_this_round >= len(SYMBOLS) else 0
 
 # ============================================================
-#  MAIN
+#  LANCEMENT — Bot Telegram + Serveur HTTP côte à côte
 # ============================================================
 async def post_init(app):
     load_users()
@@ -1078,29 +955,35 @@ async def post_init(app):
     await app.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=(
-            "🤖 *Bot MT5 démarré !*\n\n"
-            f"▸ Symboles  : `{', '.join(SYMBOLS)}`\n"
+            "🤖 *Bot MT5 démarré sur Railway !*\n\n"
+            f"▸ Symboles   : `{len(SYMBOLS)}` actifs surveillés\n"
             f"▸ Lot défaut : `{DEFAULT_LOT}`\n"
             f"▸ Timeout EA : `{CMD_TIMEOUT}s`\n\n"
             "Tape /start pour voir toutes les commandes.\n"
-            "_⚠️ Assure-toi que l'EA TelegramBridge tourne dans MT5 !_"
+            "_⚠️ Assure-toi que TelegramBridgeHTTP tourne dans MT5 !_"
         ),
         parse_mode="Markdown",
     )
-    logger.info("✅ Bot MT5 lancé.")
+    logger.info("✅ Bot MT5 lancé sur Railway.")
 
-def main():
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "METS_TON_TOKEN_ICI":
-        logger.error("❌ TELEGRAM_TOKEN non configuré ! Crée un fichier .env")
+async def run_web_server():
+    web_app = create_web_app()
+    runner  = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🌐 Serveur HTTP démarré sur le port {PORT}")
+
+async def main_async():
+    if not TELEGRAM_TOKEN:
+        logger.error("❌ TELEGRAM_TOKEN non configuré !")
         return
-
     if ADMIN_CHAT_ID == 0:
-        logger.error("❌ ADMIN_CHAT_ID non configuré ! Crée un fichier .env")
+        logger.error("❌ ADMIN_CHAT_ID non configuré !")
         return
 
-    if not os.path.exists(MT5_COMMON):
-        logger.warning(f"⚠️ Dossier MT5 introuvable : {MT5_COMMON}")
-        logger.warning("    → Configure MT5_COMMON_PATH dans .env si nécessaire")
+    # Lance le serveur HTTP en parallèle
+    await run_web_server()
 
     app = (
         Application.builder()
@@ -1108,7 +991,6 @@ def main():
         .post_init(post_init)
         .build()
     )
-
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("solde",      cmd_solde))
     app.add_handler(CommandHandler("positions",  cmd_positions))
@@ -1124,7 +1006,20 @@ def main():
     app.add_handler(CommandHandler("users",      cmd_users))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    # Boucle infinie
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
