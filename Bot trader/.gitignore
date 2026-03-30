@@ -2,3 +2,6 @@
 _env
 *.env
 authorized_users.json
+__pycache__/
+*.pyc
+*.pyo
